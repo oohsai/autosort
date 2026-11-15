@@ -44,8 +44,10 @@ The bundle is ad-hoc signed; to share it with others, sign with a Developer ID a
 
 ## Quick start
 
-1. Open the app → **Set up my Downloads folder with starter rules** (or **+ Add folder…**).
-2. Open a rule to edit it, **Preview** to check, then leave the app running (or enable launch-at-login).
+1. Open the app → **Add a folder** (or drag a folder onto the window). A popup lets you browse or quick-pick Downloads, Desktop or Documents, and optionally start with the sorting rules.
+2. **Edit** a rule (opens in a popup), **Preview** to check, then leave the app running (or enable launch-at-login).
+
+The interface is deliberately minimal: a near-black base, one mint accent, and plain-English summaries of every rule.
 
 Starter rules: trash installers older than 14 days · file screenshots into `Sorted/Screenshots/<year>-<month>` ·
 everything else with a known type into `Sorted/<Kind>`.

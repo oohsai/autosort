@@ -6,8 +6,12 @@
 //! * `autosort --once`       apply rules to existing files once and exit (`--dry-run` to preview)
 
 mod app;
+mod modals;
 mod notify;
+mod theme;
 mod tray;
+mod views;
+mod widgets;
 
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};

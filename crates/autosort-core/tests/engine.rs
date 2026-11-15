@@ -542,3 +542,21 @@ fn old_activity_logs_without_undo_fields_still_load() {
     let e = &log.snapshot()[0];
     assert!(e.undo.is_none() && !e.undone);
 }
+
+// ------------------------------------------------------------------ summaries
+
+#[test]
+fn rule_summaries_read_like_english() {
+    let mut r = rule("r", vec![ext_is("pdf"), Condition::new(Attribute::Kind, Operator::NotEquals, "other")], vec![
+        Action::new(ActionKind::Move, "~/Docs"),
+        Action::new(ActionKind::Trash, ""),
+    ]);
+    assert_eq!(r.summary(), "If extension is pdf and kind is not Other, then move to ~/Docs, then move to Trash");
+    r.match_mode = MatchMode::Any;
+    assert!(r.summary().contains(" or "));
+    r.actions.clear();
+    assert!(r.summary().ends_with("then nothing yet"));
+    r.conditions.clear();
+    assert!(r.summary().starts_with("No conditions"));
+    assert_eq!(Condition::default().summary(), "extension is …");
+}

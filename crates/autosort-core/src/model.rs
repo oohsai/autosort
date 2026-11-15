@@ -320,3 +320,50 @@ pub struct ActivityEntry {
     pub success: bool,
     pub dry_run: bool,
 }
+
+// ------------------------------------------------------------- plain-English summaries
+
+impl Condition {
+    /// e.g. "extension is jpg, png" or "kind is Images".
+    pub fn summary(&self) -> String {
+        let value = match self.attribute {
+            Attribute::Kind => crate::kind::FileKind::from_key(&self.value)
+                .map(|k| k.display_name().to_string())
+                .unwrap_or_else(|| self.value.trim().to_string()),
+            _ => self.value.trim().to_string(),
+        };
+        let value = if value.is_empty() { "…".to_string() } else { value };
+        format!("{} {} {}", self.attribute.label().to_lowercase(), self.op.label(), value)
+    }
+}
+
+impl Action {
+    /// e.g. "move to {folder}/Sorted/{kind}" or "move to Trash".
+    pub fn summary(&self) -> String {
+        let p = self.parameter.trim();
+        let p = if p.is_empty() { "…" } else { p };
+        match self.kind {
+            ActionKind::Move => format!("move to {p}"),
+            ActionKind::Copy => format!("copy to {p}"),
+            ActionKind::Rename => format!("rename to {p}"),
+            ActionKind::Trash => "move to Trash".to_string(),
+            ActionKind::RunCommand => "run a command".to_string(),
+        }
+    }
+}
+
+impl Rule {
+    /// One line describing the rule, e.g. "If extension is pdf, then move to ~/Documents".
+    pub fn summary(&self) -> String {
+        if self.conditions.is_empty() {
+            return "No conditions yet — this rule never matches".to_string();
+        }
+        let joiner = if self.match_mode == MatchMode::All { " and " } else { " or " };
+        let conds = self.conditions.iter().map(Condition::summary).collect::<Vec<_>>().join(joiner);
+        if self.actions.is_empty() {
+            return format!("If {conds}, then nothing yet");
+        }
+        let acts = self.actions.iter().map(Action::summary).collect::<Vec<_>>().join(", then ");
+        format!("If {conds}, then {acts}")
+    }
+}
