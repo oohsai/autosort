@@ -1,0 +1,35 @@
+name: build
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test engine
+        run: cargo test -p autosort-core
+      - name: Build app (Linux / Windows)
+        if: runner.os != 'macOS'
+        run: cargo build --release
+      - name: Build app bundle (macOS, universal)
+        if: runner.os == 'macOS'
+        run: UNIVERSAL=1 ./scripts/bundle-macos.sh
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'macOS'
+        with: { name: AutoSort-macOS, path: build/AutoSort.app }
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with: { name: AutoSort-Windows, path: target/release/autosort.exe }
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Linux'
+        with: { name: AutoSort-Linux, path: target/release/autosort }

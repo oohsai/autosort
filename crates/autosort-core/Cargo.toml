@@ -1,0 +1,18 @@
+[package]
+name = "autosort-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chrono = { version = "0.4.45", features = ["serde"] }
+directories = "6.0.0"
+notify = "8.2.2"
+regex = "1.13.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+trash = "5.3.0"
+uuid = { version = "1.29.2", features = ["v4", "serde"] }
+
+[dev-dependencies]
+filetime = "0.2.29"
+tempfile = "3.27.0"
