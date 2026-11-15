@@ -162,6 +162,23 @@ fn apply_filter(filter: &str, v: &str) -> Option<String> {
     })
 }
 
+/// Turns a folder picked in a dialog into the most portable way to write it in a rule: `{folder}/…` when it
+/// is inside the watched folder, `~/…` when it is under the home folder, otherwise the absolute path.
+pub fn portable_path(chosen: &Path, watched: &Path, home: Option<&Path>) -> String {
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let (chosen_c, watched_c) = (canon(chosen), canon(watched));
+    let rel_text = |rel: &Path| rel.to_string_lossy().replace('\\', "/");
+    if let Ok(rel) = chosen_c.strip_prefix(&watched_c) {
+        return if rel.as_os_str().is_empty() { "{folder}".to_string() } else { format!("{{folder}}/{}", rel_text(rel)) };
+    }
+    if let Some(home) = home {
+        if let Ok(rel) = chosen_c.strip_prefix(canon(home)) {
+            return if rel.as_os_str().is_empty() { "~".to_string() } else { format!("~/{}", rel_text(rel)) };
+        }
+    }
+    chosen.to_string_lossy().into_owned()
+}
+
 /// Expands a leading `~` to the user's home directory.
 pub fn expand_tilde(path: &str) -> PathBuf {
     let home = || directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf());

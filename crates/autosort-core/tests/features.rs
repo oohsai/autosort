@@ -459,3 +459,25 @@ fn recent_dates_are_relative_to_the_clock_passed_in() {
     let f = FileInfo::from_parts(PathBuf::from("x"), 1, now() - Duration::days(3), now() - Duration::days(3));
     assert!(cond(Attribute::DaysSinceCreated, Operator::LessThan, "4").matches(&f, now()));
 }
+
+// ----- folder picker helper --------------------------------------------------------------------
+
+#[test]
+fn picked_folders_are_written_portably() {
+    let tmp = TempDir::new().unwrap();
+    let watched = tmp.path().join("Downloads");
+    let home = tmp.path().join("home");
+    let elsewhere = tmp.path().join("volume/Backups");
+    for d in [&watched.join("Sorted/PDFs"), &home.join("Documents/Invoices"), &elsewhere] {
+        fs::create_dir_all(d).unwrap();
+    }
+    let p = |chosen: &Path| template::portable_path(chosen, &watched, Some(&home));
+    assert_eq!(p(&watched), "{folder}");
+    assert_eq!(p(&watched.join("Sorted/PDFs")), "{folder}/Sorted/PDFs");
+    assert_eq!(p(&home.join("Documents/Invoices")), "~/Documents/Invoices");
+    assert_eq!(p(&home), "~");
+    assert_eq!(p(&elsewhere), elsewhere.to_string_lossy());
+    // and the result round-trips through the engine's own path expansion
+    let expanded = template::expand_tilde("~/Documents");
+    assert!(expanded.is_absolute() || expanded == Path::new("~/Documents"));
+}

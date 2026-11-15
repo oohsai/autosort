@@ -1,6 +1,6 @@
 //! Centered popup dialogs: add folder, edit rule, confirm remove, preview.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use autosort_core::template::{TOKEN_HELP, expand_tilde};
 use autosort_core::*;
@@ -153,6 +153,7 @@ impl AutoSortApp {
         let ri = self.config.folders[fi].rules.iter().position(|r| r.id == rule_id)?;
         let max_h = (ctx.content_rect().height() - 220.0).max(260.0);
         let (mut delete, mut done) = (false, false);
+        let watched_root = self.config.folders[fi].root();
         let rule = &mut self.config.folders[fi].rules[ri];
         let resp = modal(("edit_rule", rule_id)).show(ctx, |ui| {
             ui.set_width(640.0);
@@ -163,7 +164,7 @@ impl AutoSortApp {
                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                 .show(ui, |ui| {
                 ui.set_width(ui.available_width() - 14.0);
-                rule_form(ui, rule);
+                rule_form(ui, rule, &watched_root);
             });
             ui.add_space(12.0);
             hairline(ui);
@@ -301,6 +302,33 @@ impl AutoSortApp {
 
 // --------------------------------------------------------------------- rule form
 
+/// Opens the native picker for a Move/Copy destination folder or an app to open files with, and stores the
+/// result in the action in its most portable form.
+fn choose_for_action(a: &mut Action, watched_root: &Path) {
+    let home = directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf());
+    if a.kind == ActionKind::OpenWith {
+        let mut dialog = rfd::FileDialog::new().set_title("Choose an app");
+        if cfg!(target_os = "macos") {
+            dialog = dialog.set_directory("/Applications");
+        }
+        if let Some(picked) = dialog.pick_file() {
+            // macOS opens apps by name (`open -a Preview`); elsewhere the program path is needed
+            a.parameter = if cfg!(target_os = "macos") {
+                picked.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+            } else {
+                picked.to_string_lossy().into_owned()
+            };
+        }
+        return;
+    }
+    // start where the current value points, else in the watched folder
+    let current = expand_tilde(&a.parameter.replace("{folder}", &watched_root.to_string_lossy()));
+    let start = if !a.parameter.trim().is_empty() && current.is_dir() { current } else { watched_root.to_path_buf() };
+    if let Some(dir) = rfd::FileDialog::new().set_title("Choose the destination folder").set_directory(start).pick_folder() {
+        a.parameter = autosort_core::template::portable_path(&dir, watched_root, home.as_deref());
+    }
+}
+
 fn time_drag(ui: &mut Ui, hour: &mut u8, minute: &mut u8) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
@@ -358,7 +386,7 @@ fn field_label(ui: &mut Ui, text: &str) {
     ui.label(RichText::new(text).small().color(t::DIM));
 }
 
-fn rule_form(ui: &mut Ui, rule: &mut Rule) {
+fn rule_form(ui: &mut Ui, rule: &mut Rule, watched_root: &Path) {
     ui.spacing_mut().item_spacing = vec2(8.0, 10.0);
 
     if !rule.approved {
@@ -472,11 +500,15 @@ fn rule_form(ui: &mut Ui, rule: &mut Rule) {
                 if a.kind == ActionKind::AddTags && !cfg!(unix) {
                     ui.label(RichText::new("Tags aren't supported on Windows").small().color(t::DIM));
                 } else if a.kind.uses_parameter() {
-                    let w = (ui.available_width() - 32.0).max(80.0);
+                    let picker = matches!(a.kind, ActionKind::Move | ActionKind::Copy | ActionKind::OpenWith);
+                    let w = (ui.available_width() - 32.0 - if picker { 104.0 } else { 0.0 }).max(80.0);
                     ui.add_sized(
                         [w, 32.0],
                         egui::TextEdit::singleline(&mut a.parameter).hint_text(a.kind.placeholder()).margin(Margin::symmetric(10, 7)),
                     );
+                    if picker && ghost(ui, if a.kind == ActionKind::OpenWith { "Choose app…" } else { "Choose…" }).clicked() {
+                        choose_for_action(a, watched_root);
+                    }
                 }
                 if quiet(ui, "×").on_hover_text("Remove action").clicked() {
                     remove = Some(i);
