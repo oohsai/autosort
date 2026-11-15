@@ -25,7 +25,7 @@ pub fn apply(op: &UndoOp, history: &History) -> Result<String, String> {
             move_file(to, from).map_err(|e| format!("could not move it back: {e}"))?;
             // The restored file must not be sorted again straight away.
             if let Ok(info) = FileInfo::load(from) {
-                history.insert(from, info.modified.into());
+                history.insert(None, from, info.modified.into());
                 history.save();
             }
             Ok(format!("Restored to {}", from.display()))

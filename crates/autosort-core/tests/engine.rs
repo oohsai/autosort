@@ -422,7 +422,7 @@ fn service_reacts_to_new_files() {
     let config = Arc::new(Mutex::new(AppConfig { folders: vec![f], settle_seconds: 0, ..Default::default() }));
     let log: Arc<Mutex<Vec<ActivityEntry>>> = Arc::default();
     let sink_log = log.clone();
-    let service = Service::start(config, Arc::new(History::in_memory()), Arc::new(move |e| sink_log.lock().unwrap().extend(e)));
+    let service = Service::start(config, Arc::new(History::in_memory()), Arc::new(Stats::in_memory()), Arc::new(move |e| sink_log.lock().unwrap().extend(e)));
     std::thread::sleep(StdDuration::from_millis(400)); // let the watcher attach
 
     fs::write(dir.path().join("late.pdf"), "x").unwrap();

@@ -157,8 +157,12 @@ impl AutoSortApp {
         let resp = modal(("edit_rule", rule_id)).show(ctx, |ui| {
             ui.set_width(640.0);
             title(ui, "Edit rule", "Describe which files to match and what to do with them.");
-            egui::ScrollArea::vertical().max_height(max_h).auto_shrink([true, true]).show(ui, |ui| {
-                ui.set_width(ui.available_width());
+            egui::ScrollArea::vertical()
+                .max_height(max_h)
+                .auto_shrink([true, true])
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                .show(ui, |ui| {
+                ui.set_width(ui.available_width() - 14.0);
                 rule_form(ui, rule);
             });
             ui.add_space(12.0);
@@ -240,6 +244,9 @@ impl AutoSortApp {
                 }
                 Some(list) => {
                     ui.label(RichText::new(format!("{} action{}", list.len(), if list.len() == 1 { "" } else { "s" })).color(t::TEXT));
+                    if list.iter().any(|e| e.rule.contains("awaiting approval")) {
+                        ui.label(RichText::new("Rules marked “awaiting approval” are shown here but won't run until you approve them.").small().color(t::DIM));
+                    }
                     ui.add_space(4.0);
                     egui::ScrollArea::vertical().max_height(300.0).auto_shrink([true, true]).show(ui, |ui| {
                         Frame::new()
@@ -294,12 +301,85 @@ impl AutoSortApp {
 
 // --------------------------------------------------------------------- rule form
 
+fn time_drag(ui: &mut Ui, hour: &mut u8, minute: &mut u8) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.label(RichText::new("at").color(t::DIM));
+        ui.add(egui::DragValue::new(hour).range(0..=23).custom_formatter(|v, _| format!("{:02}", v as i64)));
+        ui.label(":");
+        ui.add(egui::DragValue::new(minute).range(0..=59).custom_formatter(|v, _| format!("{:02}", v as i64)));
+    });
+}
+
+fn schedule_editor(ui: &mut Ui, schedule: &mut Schedule) {
+    let mut kind: u8 = match schedule {
+        Schedule::Always => 0,
+        Schedule::Daily { .. } => 1,
+        Schedule::Weekly { .. } => 2,
+    };
+    let before = kind;
+    segmented(ui, &mut kind, &[(0u8, "Always"), (1, "Daily"), (2, "Weekly")]);
+    if kind != before {
+        *schedule = match kind {
+            0 => Schedule::Always,
+            1 => Schedule::Daily { hour: 9, minute: 0 },
+            _ => Schedule::Weekly { weekday: 6, hour: 9, minute: 0 },
+        };
+    }
+    match schedule {
+        Schedule::Always => {
+            ui.label(RichText::new("As soon as files arrive.").small().color(t::DIM));
+        }
+        Schedule::Daily { hour, minute } => {
+            time_drag(ui, hour, minute);
+        }
+        Schedule::Weekly { weekday, hour, minute } => {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                for (i, name) in WEEKDAYS.iter().enumerate() {
+                    if chip(ui, &name[..3], *weekday as usize == i).clicked() {
+                        *weekday = i as u8;
+                    }
+                }
+            });
+            time_drag(ui, hour, minute);
+        }
+    }
+    if *schedule != Schedule::Always {
+        ui.label(
+            RichText::new("Runs once at that time while AutoSort is open or running in the background, or when you press Run now.")
+                .small()
+                .color(t::DIM),
+        );
+    }
+}
+
 fn field_label(ui: &mut Ui, text: &str) {
     ui.label(RichText::new(text).small().color(t::DIM));
 }
 
 fn rule_form(ui: &mut Ui, rule: &mut Rule) {
     ui.spacing_mut().item_spacing = vec2(8.0, 10.0);
+
+    if !rule.approved {
+        card(ui, |ui| {
+            egui::Sides::new().show(
+                ui,
+                |ui| {
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        ui.label(RichText::new("Learning mode: preview only").strong());
+                        ui.label(RichText::new("Use Preview on the folder to check what this rule would do, then approve it.").small().color(t::DIM));
+                    });
+                },
+                |ui| {
+                    if primary(ui, "Approve").clicked() {
+                        rule.approved = true;
+                    }
+                },
+            );
+        });
+    }
 
     field_label(ui, "Name");
     ui.add_sized([ui.available_width(), 34.0], egui::TextEdit::singleline(&mut rule.name).margin(Margin::symmetric(10, 8)));
@@ -316,7 +396,7 @@ fn rule_form(ui: &mut Ui, rule: &mut Rule) {
         for (i, c) in rule.conditions.iter_mut().enumerate() {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
-                egui::ComboBox::from_id_salt(("attr", c.id)).width(150.0).selected_text(c.attribute.label()).show_ui(ui, |ui| {
+                egui::ComboBox::from_id_salt(("attr", c.id)).width(170.0).selected_text(c.attribute.label()).show_ui(ui, |ui| {
                     for a in Attribute::ALL {
                         ui.selectable_value(&mut c.attribute, a, a.label());
                     }
@@ -328,13 +408,18 @@ fn rule_form(ui: &mut Ui, rule: &mut Rule) {
                 if c.attribute == Attribute::Kind && FileKind::from_key(&c.value).is_none() {
                     c.value = FileKind::Image.key().to_string();
                 }
-                egui::ComboBox::from_id_salt(("op", c.id)).width(140.0).selected_text(c.op.label()).show_ui(ui, |ui| {
-                    for op in c.attribute.allowed_operators() {
-                        ui.selectable_value(&mut c.op, *op, op.label());
-                    }
-                });
+                egui::ComboBox::from_id_salt(("op", c.id))
+                    .width(150.0)
+                    .selected_text(c.attribute.operator_label(c.op))
+                    .show_ui(ui, |ui| {
+                        for op in c.attribute.allowed_operators() {
+                            ui.selectable_value(&mut c.op, *op, c.attribute.operator_label(*op));
+                        }
+                    });
                 let w = (ui.available_width() - 32.0).max(80.0);
-                if c.attribute == Attribute::Kind {
+                if c.attribute.is_valueless() {
+                    ui.add_space(w);
+                } else if c.attribute == Attribute::Kind {
                     let current = FileKind::from_key(&c.value).unwrap_or(FileKind::Image);
                     egui::ComboBox::from_id_salt(("kind", c.id)).width(w - 14.0).selected_text(current.display_name()).show_ui(ui, |ui| {
                         for k in FileKind::ALL {
@@ -347,6 +432,9 @@ fn rule_form(ui: &mut Ui, rule: &mut Rule) {
                     let hint = match c.attribute {
                         Attribute::Name => "text or regex",
                         Attribute::Extension => "jpg, png, heic",
+                        Attribute::WhereFrom => "github.com",
+                        Attribute::Contents => "invoice",
+                        Attribute::Tag => "Red, Work…",
                         _ => "number",
                     };
                     ui.add_sized([w, 32.0], egui::TextEdit::singleline(&mut c.value).hint_text(hint).margin(Margin::symmetric(10, 7)));
@@ -376,12 +464,14 @@ fn rule_form(ui: &mut Ui, rule: &mut Rule) {
         for (i, a) in rule.actions.iter_mut().enumerate() {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
-                egui::ComboBox::from_id_salt(("akind", a.id)).width(210.0).selected_text(a.kind.label()).show_ui(ui, |ui| {
+                egui::ComboBox::from_id_salt(("akind", a.id)).width(200.0).selected_text(a.kind.label()).show_ui(ui, |ui| {
                     for k in ActionKind::ALL {
                         ui.selectable_value(&mut a.kind, k, k.label());
                     }
                 });
-                if a.kind.uses_parameter() {
+                if a.kind == ActionKind::AddTags && !cfg!(unix) {
+                    ui.label(RichText::new("Tags aren't supported on Windows").small().color(t::DIM));
+                } else if a.kind.uses_parameter() {
                     let w = (ui.available_width() - 32.0).max(80.0);
                     ui.add_sized(
                         [w, 32.0],
@@ -418,6 +508,10 @@ fn rule_form(ui: &mut Ui, rule: &mut Rule) {
         }
         ui.label(RichText::new(format!("Tokens you can use in paths and names:  {TOKEN_HELP}")).small().color(t::FAINT));
     });
+
+    ui.add_space(4.0);
+    section_label(ui, "Runs");
+    card(ui, |ui| schedule_editor(ui, &mut rule.schedule));
 
     ui.add_space(4.0);
     let mut keep_going = !rule.stop_processing;

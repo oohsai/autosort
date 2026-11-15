@@ -7,15 +7,20 @@ Watch folders, define *rules* (conditions → actions), and AutoSort files thing
 
 | | |
 |---|---|
-| **Conditions** | name (contains / starts / ends / equals / **regex**), extension list (`jpg, png, heic`), kind (image, video, PDF, archive, installer…), size (MB), days since modified / created. Match **all** or **any**. |
-| **Actions** | move, copy, rename (keeps extension), move to Trash/Recycle Bin, run a shell command. Chain several per rule. |
-| **Smart destinations** | tokens in paths & names: `{name} {filename} {ext} {kind} {year} {month} {monthName} {day} {date} {today} {folder}` — e.g. `~/Pictures/{year}/{monthName}`. |
-| **Conflicts** | per action: keep both (`report 2.pdf`), skip, or replace. |
-| **Safety** | **Preview** shows exactly what would happen without touching files. Files still being written (recent mtime, `.crdownload`, `.part`, `.tmp`…) and hidden files are left alone. A history stops copy/rename rules from looping. A lock stops two copies running. |
-| **Undo** | Every move, copy and rename is reversible from the **Activity** page (copies go to the Trash). Undo never overwrites: if the original spot is taken or the file changed since, it refuses and says why. Restored files are not re-sorted. |
-| **Notifications** | One summary notification per batch ("12 actions completed…"), never one per file. Toggle in Settings. |
+| **Conditions** | name (contains / starts / ends / equals / **regex**), extension list (`jpg, png, heic`), kind, size, days since modified / created / **last opened** · **downloaded from** (the site a file came from) · **photo date taken** (EXIF) · **contents** (text inside plain text, PDF, Word/PowerPoint/Excel, OpenDocument) · **Finder tags** · **duplicate** (identical content, including files you already sorted). Match **all** or **any**. |
+| **Actions** | move, copy, rename, **add Finder tags** (colour names like `Red` become Finder labels on macOS), **open with an app**, **run a macOS Shortcut**, move to Trash/Recycle Bin, run a shell command. Chain several per rule. |
+| **Smart renaming** | tokens plus filters: `{name\|kebab}`, `{name\|lower\|replace:_: }`, `{name\|slice:0:20}`, `{name\|regex:\d+:N}`, `{counter:3}` (next free number), `{source}` (website), `{takenYear}/{takenMonthName}` (photo date). |
+| **Schedules** | a rule can run *always*, *daily at 09:00* or *weekly on Sunday at 08:00* — e.g. "archive files older than 30 days every Sunday". **Run now** forces scheduled rules. |
+| **Learning mode** | new, imported and starter rules only **preview** until you press **Approve**, so a bad rule can't touch real files. (Turn off in Settings.) |
+| **Ignore lists** | per-folder patterns (`*.psd`, `draft*`, `Archive/`, `photos/raw/*`) that rules never touch. |
+| **Stats** | each rule shows how many files it has handled and when it last ran. |
+| **Import / export** | save a folder's rules to a file and load them elsewhere (fresh ids, learning mode respected). |
+| **Right-click in Finder** | Settings → *File manager* → **Install** adds **Sort with AutoSort** (macOS Quick Action, Windows Explorer, Nautilus/Dolphin). It sorts the selection with the rules of the watched folder it is in — immediately, ignoring the settle delay. Same as `autosort --sort PATH…`. |
+| **Undo** | every move, copy and rename is reversible from **Activity** (copies go to the Trash). Undo never overwrites; restored files are not re-sorted. |
+| **Notifications** | one summary per batch, never one per file. |
 | **Tray / menu bar** | macOS and Windows: open, pause, run now, quit. Closing the window minimises it; use the tray's *Quit AutoSort* to exit. On Linux use `--headless`. |
-| **Runs how you like** | desktop app, `--headless` daemon, or `--once` from a terminal / cron. Optional launch-at-login. |
+| **Safety** | **Preview** shows what would happen without touching files. Files still being written, hidden files and partial downloads are left alone. History is **per rule**, so copy/rename rules can't loop while other rules (like a scheduled cleanup) can still see a file. Only one copy runs at a time. |
+| **Runs how you like** | desktop app, `--headless` daemon, `--once` from a terminal / cron, or `--sort` from your file manager. Optional launch-at-login. |
 
 Rules run top-to-bottom on each file. The first matching rule wins unless you tick **Keep going**.
 
@@ -27,7 +32,8 @@ Needs only a Rust toolchain ([rustup.rs](https://rustup.rs)). No other dependenc
 cargo run --release                      # desktop app
 cargo run --release -- --once --dry-run  # preview from the terminal
 cargo run --release -- --headless        # background daemon, no window
-cargo test -p autosort-core              # engine tests
+cargo test --workspace                   # engine + command-line tests (89)
+cargo run --release -- --sort ~/Downloads/some.pdf   # sort a file now
 ```
 
 ### macOS app bundle
@@ -65,4 +71,4 @@ Config, activity log and history live in the OS config dir (`~/Library/Applicati
 
 ## Not yet built
 
-Finder tags and content-based conditions (file text, EXIF), per-rule "ignore" lists, tray icon on Linux, true hide-to-tray.
+Tray icon on Linux, true hide-to-tray, unzip/compress/convert actions, a rules gallery.

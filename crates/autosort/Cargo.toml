@@ -17,3 +17,8 @@ uuid = { version = "1.29.2", features = ["v4"] }
 
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 tray-icon = "0.26.1"
+
+[dev-dependencies]
+filetime = "0.2.29"
+serde_json = "1.0.154"
+tempfile = "3.27.0"

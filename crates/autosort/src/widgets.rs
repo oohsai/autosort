@@ -234,7 +234,7 @@ pub fn nav_item(ui: &mut Ui, selected: bool, icon: Icon, label: &str, status: Op
         let bar = Rect::from_min_size(rect.left_top() + vec2(0.0, 9.0), vec2(3.0, rect.height() - 18.0));
         ui.painter().rect_filled(bar, CornerRadius::same(2), t::ACCENT);
     }
-    let fg = if selected { t::TEXT } else if hover { t::TEXT } else { t::DIM };
+    let fg = if selected || hover { t::TEXT } else { t::DIM };
     paint_icon(ui, icon, rect.left_center() + vec2(24.0, 0.0), if selected { t::ACCENT } else { fg });
     let max_w = rect.width() - 64.0;
     let mut text = label.to_string();

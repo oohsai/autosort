@@ -8,8 +8,9 @@ use chrono::Local;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use uuid::Uuid;
 
-use crate::engine::Engine;
+use crate::engine::{Engine, RunOptions};
 use crate::history::History;
+use crate::stats::Stats;
 use crate::model::{ActivityEntry, AppConfig, WatchedFolder};
 
 /// Quiet period after the last filesystem event before a folder is processed.
@@ -21,6 +22,8 @@ enum Cmd {
     Fs(Vec<std::path::PathBuf>),
     Reload,
     RunNow,
+    /// A normal (non-forced) pass over every enabled folder, e.g. right after approving a rule.
+    Sweep,
     Pause(bool),
     Stop,
 }
@@ -34,12 +37,12 @@ pub struct Service {
 }
 
 impl Service {
-    pub fn start(config: Arc<Mutex<AppConfig>>, history: Arc<History>, sink: EntrySink) -> Service {
+    pub fn start(config: Arc<Mutex<AppConfig>>, history: Arc<History>, stats: Arc<Stats>, sink: EntrySink) -> Service {
         let (tx, rx) = mpsc::channel();
         let worker_tx = tx.clone();
         let join = std::thread::Builder::new()
             .name("autosort-service".into())
-            .spawn(move || worker(rx, worker_tx, config, history, sink))
+            .spawn(move || worker(rx, worker_tx, config, history, stats, sink))
             .expect("spawn service thread");
         Service { tx, join: Some(join) }
     }
@@ -50,6 +53,10 @@ impl Service {
     }
     pub fn run_now(&self) {
         let _ = self.tx.send(Cmd::RunNow);
+    }
+    /// Re-checks all folders immediately without forcing scheduled rules to run.
+    pub fn sweep(&self) {
+        let _ = self.tx.send(Cmd::Sweep);
     }
     pub fn set_paused(&self, paused: bool) {
         let _ = self.tx.send(Cmd::Pause(paused));
@@ -90,12 +97,22 @@ fn build_watcher(tx: &Sender<Cmd>, folders: &[WatchedFolder]) -> Option<Recommen
 
 // `watcher` is held only to keep the OS watch alive (RAII); reassigning it drops the old one.
 #[allow(unused_assignments, unused_variables)]
-fn worker(rx: mpsc::Receiver<Cmd>, tx: Sender<Cmd>, config: Arc<Mutex<AppConfig>>, history: Arc<History>, sink: EntrySink) {
+fn worker(
+    rx: mpsc::Receiver<Cmd>,
+    tx: Sender<Cmd>,
+    config: Arc<Mutex<AppConfig>>,
+    history: Arc<History>,
+    stats: Arc<Stats>,
+    sink: EntrySink,
+) {
     let snapshot = || config.lock().unwrap().clone();
-    let run_folders = |folders: Vec<&WatchedFolder>, settle: u64| {
-        let engine = Engine::new(settle, history.clone());
+    let run_folders = |folders: Vec<&WatchedFolder>, settle: u64, force: bool| {
+        history.refresh();
+        stats.refresh();
+        let engine = Engine::new(settle, history.clone()).with_stats(stats.clone());
+        let opts = RunOptions { force_scheduled: force, ..Default::default() };
         for f in folders {
-            let entries = engine.process(f, false, Local::now());
+            let entries = engine.process_with(f, &opts, Local::now());
             if !entries.is_empty() {
                 sink(entries);
             }
@@ -108,7 +125,7 @@ fn worker(rx: mpsc::Receiver<Cmd>, tx: Sender<Cmd>, config: Arc<Mutex<AppConfig>
     let mut last_sweep = Instant::now();
     {
         let cfg = snapshot();
-        run_folders(cfg.folders.iter().filter(|f| f.enabled).collect(), cfg.settle_seconds);
+        run_folders(cfg.folders.iter().filter(|f| f.enabled).collect(), cfg.settle_seconds, false);
     }
 
     loop {
@@ -126,7 +143,13 @@ fn worker(rx: mpsc::Receiver<Cmd>, tx: Sender<Cmd>, config: Arc<Mutex<AppConfig>
             Ok(Cmd::RunNow) => {
                 if !paused {
                     let cfg = snapshot();
-                    run_folders(cfg.folders.iter().filter(|f| f.enabled).collect(), cfg.settle_seconds);
+                    run_folders(cfg.folders.iter().filter(|f| f.enabled).collect(), cfg.settle_seconds, true);
+                }
+            }
+            Ok(Cmd::Sweep) => {
+                if !paused {
+                    let cfg = snapshot();
+                    run_folders(cfg.folders.iter().filter(|f| f.enabled).collect(), cfg.settle_seconds, false);
                 }
             }
             Ok(Cmd::Pause(p)) => {
@@ -137,7 +160,7 @@ fn worker(rx: mpsc::Receiver<Cmd>, tx: Sender<Cmd>, config: Arc<Mutex<AppConfig>
                 } else {
                     watcher = build_watcher(&tx, &snapshot().folders);
                     let cfg = snapshot();
-                    run_folders(cfg.folders.iter().filter(|f| f.enabled).collect(), cfg.settle_seconds);
+                    run_folders(cfg.folders.iter().filter(|f| f.enabled).collect(), cfg.settle_seconds, false);
                 }
             }
             Ok(Cmd::Fs(paths)) => {
@@ -172,7 +195,7 @@ fn worker(rx: mpsc::Receiver<Cmd>, tx: Sender<Cmd>, config: Arc<Mutex<AppConfig>
                 last_sweep = now;
                 pending.clear();
             }
-            run_folders(folders, cfg.settle_seconds);
+            run_folders(folders, cfg.settle_seconds, false);
         }
     }
 }

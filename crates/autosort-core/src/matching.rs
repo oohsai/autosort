@@ -30,6 +30,39 @@ impl Condition {
             Attribute::SizeMb => compare_number(f.size as f64 / 1_048_576.0, self.op, &self.value),
             Attribute::DaysSinceModified => compare_number(days(f.modified), self.op, &self.value),
             Attribute::DaysSinceCreated => compare_number(days(f.created), self.op, &self.value),
+            Attribute::DaysSinceOpened => compare_number(days(f.accessed), self.op, &self.value),
+            Attribute::DaysSinceTaken => match f.taken() {
+                Some(t) => compare_number(days(t), self.op, &self.value),
+                None => false,
+            },
+            Attribute::WhereFrom => {
+                let urls = f.origin_urls();
+                match self.op {
+                    // negative operators hold only if *no* URL satisfies the positive form
+                    Operator::DoesNotContain => !urls.iter().any(|u| compare_text(u, Operator::Contains, &self.value)),
+                    Operator::NotEquals => !urls.iter().any(|u| compare_text(u, Operator::Equals, &self.value)),
+                    op => urls.iter().any(|u| compare_text(u, op, &self.value)),
+                }
+            }
+            Attribute::Contents => match (f.contents(), self.op) {
+                (Some(text), op) => compare_text(text, op, &self.value),
+                (None, Operator::DoesNotContain) => true,
+                (None, _) => false,
+            },
+            Attribute::Tag => {
+                let want = self.value.trim().to_lowercase();
+                let has = |pred: &dyn Fn(&str) -> bool| f.tags().iter().any(|t| pred(&t.to_lowercase()));
+                match self.op {
+                    Operator::Equals => has(&|t| t == want),
+                    Operator::NotEquals => !has(&|t| t == want),
+                    Operator::Contains => !want.is_empty() && has(&|t| t.contains(&want)),
+                    _ => false,
+                }
+            }
+            Attribute::Duplicate => match self.op {
+                Operator::NotEquals => !f.is_duplicate(),
+                _ => f.is_duplicate(),
+            },
         }
     }
 }

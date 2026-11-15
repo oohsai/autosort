@@ -16,6 +16,9 @@ enum FolderCmd {
     StarterRules,
     NewRule,
     Edit(Uuid),
+    Approve(Uuid),
+    Export,
+    Import,
     Rule(usize, RuleCmd),
 }
 
@@ -121,7 +124,9 @@ impl AutoSortApp {
 
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.set_max_width(ui.available_width().min(880.0));
+            let stats = self.stats.clone();
             let folder = &mut self.config.folders[idx];
+            let has_rules = !folder.rules.is_empty();
 
             // header
             egui::Sides::new().height(54.0).shrink_left().truncate().show(
@@ -151,6 +156,10 @@ impl AutoSortApp {
                 hairline(ui);
                 ui.add_space(4.0);
                 setting_row(ui, "Include subfolders", "Also sort files inside folders within this one.", &mut folder.include_subfolders);
+                ui.add_space(4.0);
+                hairline(ui);
+                ui.add_space(2.0);
+                ignore_editor(ui, folder);
             });
 
             // rules
@@ -162,6 +171,16 @@ impl AutoSortApp {
                     if link(ui, "+  New rule").clicked() {
                         cmd = Some(FolderCmd::NewRule);
                     }
+                    ui.menu_button(RichText::new("···").color(t::DIM), |ui| {
+                        if ui.button("Import rules…").clicked() {
+                            cmd = Some(FolderCmd::Import);
+                            ui.close();
+                        }
+                        if ui.add_enabled(has_rules, egui::Button::new("Export rules…")).clicked() {
+                            cmd = Some(FolderCmd::Export);
+                            ui.close();
+                        }
+                    });
                 },
             );
             ui.add_space(2.0);
@@ -188,17 +207,36 @@ impl AutoSortApp {
             let count = folder.rules.len();
             for (i, rule) in folder.rules.iter_mut().enumerate() {
                 let (rid, name, summary, was_enabled) = (rule.id, rule.name.clone(), rule.summary(), rule.enabled);
+                let (approved, schedule) = (rule.approved, rule.schedule);
+                let st = stats.get(rid);
                 card(ui, |ui| {
-                    egui::Sides::new().height(44.0).shrink_left().truncate().show(
+                    egui::Sides::new().height(58.0).shrink_left().truncate().show(
                         ui,
                         |ui| {
                             toggle(ui, &mut rule.enabled);
                             ui.add_space(4.0);
                             ui.vertical(|ui| {
                                 ui.spacing_mut().item_spacing.y = 3.0;
-                                let name_color = if was_enabled { t::TEXT } else { t::DIM };
-                                ui.add(egui::Label::new(RichText::new(&name).strong().color(name_color)).truncate());
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 8.0;
+                                    let name_color = if was_enabled { t::TEXT } else { t::DIM };
+                                    ui.label(RichText::new(&name).strong().color(name_color));
+                                    if !approved {
+                                        badge(ui, "Preview only", t::TEXT, t::SURFACE_HI, Stroke::new(1.0, t::BORDER_HI));
+                                    }
+                                    if schedule != Schedule::Always {
+                                        badge(ui, &schedule.summary(), t::ACCENT, t::ACCENT_SOFT, Stroke::new(1.0, t::ACCENT.gamma_multiply(0.5)));
+                                    }
+                                });
                                 ui.add(egui::Label::new(RichText::new(&summary).small().color(t::DIM)).truncate());
+                                let usage = match st.last_match {
+                                    Some(last) if st.files > 0 => {
+                                        format!("{} file{} handled  ·  last {}", st.files, if st.files == 1 { "" } else { "s" }, fmt_time(last))
+                                    }
+                                    _ if !approved => "Waiting for your approval — nothing has been changed yet".to_string(),
+                                    _ => "Hasn't handled any files yet".to_string(),
+                                };
+                                ui.add(egui::Label::new(RichText::new(usage).small().color(t::FAINT)).truncate());
                             });
                         },
                         |ui| {
@@ -223,6 +261,9 @@ impl AutoSortApp {
                             });
                             if ghost(ui, "Edit").clicked() {
                                 cmd = Some(FolderCmd::Edit(rid));
+                            }
+                            if !approved && primary(ui, "Approve").on_hover_text("Let this rule start changing files").clicked() {
+                                cmd = Some(FolderCmd::Approve(rid));
                             }
                         },
                     );
@@ -250,9 +291,49 @@ impl AutoSortApp {
                 self.toast("Running rules…", true);
             }
             Some(FolderCmd::Remove) => self.modal = Some(ModalState::ConfirmRemove(id)),
-            Some(FolderCmd::StarterRules) => self.config.folders[idx].rules.extend(presets::downloads_starter_rules()),
+            Some(FolderCmd::StarterRules) => {
+                let learning = self.config.learning_mode;
+                let mut rules = presets::downloads_starter_rules();
+                rules.iter_mut().for_each(|r| r.approved = !learning);
+                self.config.folders[idx].rules.extend(rules);
+                if learning {
+                    self.toast("Starter rules added — Preview them, then Approve", true);
+                }
+            }
+            Some(FolderCmd::Approve(rid)) => {
+                if let Some(r) = self.config.folders[idx].rules.iter_mut().find(|r| r.id == rid) {
+                    r.approved = true;
+                }
+                self.pending_sweep = true;
+                self.toast("Rule approved — it will run from now on", true);
+            }
+            Some(FolderCmd::Export) => {
+                let rules = self.config.folders[idx].rules.clone();
+                let name = format!("{}-rules.json", self.config.folders[idx].display_name().to_lowercase().replace(' ', "-"));
+                if let Some(path) = rfd::FileDialog::new().set_title("Export rules").set_file_name(&name).add_filter("AutoSort rules", &["json"]).save_file() {
+                    match std::fs::write(&path, rules_io::export_rules(&rules)) {
+                        Ok(()) => self.toast(format!("Exported {} rule{}", rules.len(), if rules.len() == 1 { "" } else { "s" }), true),
+                        Err(e) => self.toast(format!("Could not save: {e}"), false),
+                    }
+                }
+            }
+            Some(FolderCmd::Import) => {
+                if let Some(path) = rfd::FileDialog::new().set_title("Import rules").add_filter("AutoSort rules", &["json"]).pick_file() {
+                    let learning = self.config.learning_mode;
+                    match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|t| rules_io::import_rules(&t, learning)) {
+                        Ok(rules) => {
+                            let n = rules.len();
+                            self.config.folders[idx].rules.extend(rules);
+                            let tail = if learning && n > 0 { " — Preview and approve them to start" } else { "" };
+                            self.toast(format!("Imported {n} rule{}{tail}", if n == 1 { "" } else { "s" }), true);
+                        }
+                        Err(e) => self.toast(format!("Could not import: {e}"), false),
+                    }
+                }
+            }
             Some(FolderCmd::NewRule) => {
                 let mut r = Rule::new("New rule");
+                r.approved = !self.config.learning_mode;
                 r.conditions.push(Condition::default());
                 r.actions.push(Action::new(ActionKind::Move, ""));
                 let rid = r.id;
@@ -369,6 +450,15 @@ impl AutoSortApp {
             ui.add_space(4.0);
             hairline(ui);
             ui.add_space(4.0);
+            setting_row(
+                ui,
+                "Learning mode",
+                "New, imported and starter rules only preview until you approve them.",
+                &mut self.config.learning_mode,
+            );
+            ui.add_space(4.0);
+            hairline(ui);
+            ui.add_space(4.0);
             let mut launch = self.launch_at_login;
             if setting_row(ui, "Launch at login", "Start AutoSort minimised when you sign in.", &mut launch) {
                 let result = match auto_launch() {
@@ -400,6 +490,45 @@ impl AutoSortApp {
         });
 
         ui.add_space(14.0);
+        section_label(ui, "File manager");
+        ui.add_space(2.0);
+        card(ui, |ui| {
+            let installed = autosort_core::integration::is_installed();
+            let mut action = None;
+            egui::Sides::new().show(
+                ui,
+                |ui| {
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        ui.label("Right-click “Sort with AutoSort”");
+                        let hint = if installed { "Installed — right-click any file or folder in a watched folder." } else { "Sort files from Finder or Explorer without opening AutoSort." };
+                        ui.label(RichText::new(hint).small().color(t::DIM));
+                    });
+                },
+                |ui| {
+                    if installed {
+                        if ghost(ui, "Remove").clicked() {
+                            action = Some(false);
+                        }
+                    } else if primary(ui, "Install").clicked() {
+                        action = Some(true);
+                    }
+                },
+            );
+            match action {
+                Some(true) => match std::env::current_exe().map_err(|e| e.to_string()).and_then(|exe| autosort_core::integration::install(&exe)) {
+                    Ok(msg) => self.toast(msg, true),
+                    Err(e) => self.toast(format!("Could not install: {e}"), false),
+                },
+                Some(false) => match autosort_core::integration::uninstall() {
+                    Ok(msg) => self.toast(msg, true),
+                    Err(e) => self.toast(format!("Could not remove: {e}"), false),
+                },
+                None => {}
+            }
+        });
+
+        ui.add_space(14.0);
         section_label(ui, "About");
         ui.add_space(2.0);
         card(ui, |ui| {
@@ -411,6 +540,33 @@ impl AutoSortApp {
             ui.label(RichText::new("Run without a window:  autosort --headless    Preview from a terminal:  autosort --once --dry-run").small().color(t::FAINT));
         });
     }
+}
+
+/// Collapsible multi-line editor for the folder's ignore patterns (one per line).
+fn ignore_editor(ui: &mut Ui, folder: &mut WatchedFolder) {
+    let id = egui::Id::unique(("ignore_buf", folder.id));
+    let count = folder.ignore.len();
+    let title = if count == 0 { "Ignore files".to_string() } else { format!("Ignore files ({count})") };
+    egui::CollapsingHeader::new(RichText::new(title).color(t::TEXT))
+        .id_salt(("ignore_hdr", folder.id))
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.label(RichText::new("Rules never touch matching files. One pattern per line:  *.psd   draft*   Archive/   photos/raw/*").small().color(t::DIM));
+            let mut buf: String = ui.data_mut(|d| d.get_temp(id)).unwrap_or_else(|| folder.ignore.join("\n"));
+            let changed = ui
+                .add(
+                    egui::TextEdit::multiline(&mut buf)
+                        .desired_rows(4)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("*.psd")
+                        .margin(Margin::symmetric(10, 8)),
+                )
+                .changed();
+            if changed {
+                folder.ignore = buf.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+            }
+            ui.data_mut(|d| d.insert_temp(id, buf));
+        });
 }
 
 // ----------------------------------------------------------------- activity row

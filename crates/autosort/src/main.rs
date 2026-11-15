@@ -1,9 +1,10 @@
 //! AutoSort — rule-based automatic file organiser.
 //!
-//! * `autosort`              open the desktop app (rules run in the background while it is open)
-//! * `autosort --minimized`  same, but start minimised (used for "launch at login")
-//! * `autosort --headless`   no window: watch folders and apply rules (servers, services)
-//! * `autosort --once`       apply rules to existing files once and exit (`--dry-run` to preview)
+//! * `autosort`                     open the desktop app (rules run in the background while it is open)
+//! * `autosort --minimized`         same, but start minimised (used for "launch at login")
+//! * `autosort --headless`          no window: watch folders and apply rules (servers, services)
+//! * `autosort --once [--dry-run]`  apply rules to existing files once and exit
+//! * `autosort --sort PATH...`      sort these files/folders now (what the right-click action runs)
 
 mod app;
 mod modals;
@@ -13,25 +14,33 @@ mod tray;
 mod views;
 mod widgets;
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
 use autosort_core::store::{self, ActivityLog, InstanceLock, Paths};
-use autosort_core::{AppConfig, Engine, History, Service};
+use autosort_core::{AppConfig, Engine, History, RunOptions, Service, Stats, integration, sorting};
 
 const HELP: &str = "AutoSort — rule-based automatic file organiser
 
 USAGE:
     autosort [OPTIONS]
+    autosort --sort PATH...
 
 OPTIONS:
-    --headless    Run without a window: watch folders and apply rules until stopped
-    --once        Apply rules to the files currently in the watched folders, then exit
-    --dry-run     With --once: only print what would happen, change nothing
-    --minimized   Start the desktop app minimised
-    -h, --help    Show this help
+    --headless                Run without a window: watch folders and apply rules until stopped
+    --once                    Apply rules to the files currently in the watched folders, then exit
+    --dry-run                 With --once: only print what would happen, change nothing
+    --sort PATH...            Sort these files or folders now, using the rules of the watched folder
+                              they are in (this is what the right-click action runs)
+    --install-integration     Add \"Sort with AutoSort\" to your file manager's right-click menu
+    --uninstall-integration   Remove it again
+    --minimized               Start the desktop app minimised
+    -h, --help                Show this help
 
 Config lives in the OS config dir (override with AUTOSORT_HOME).";
+
+const FLAGS: [&str; 6] = ["--headless", "--once", "--dry-run", "--minimized", "--install-integration", "--uninstall-integration"];
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -40,7 +49,14 @@ fn main() -> ExitCode {
         println!("{HELP}");
         return ExitCode::SUCCESS;
     }
-    if let Some(bad) = args.iter().find(|a| !["--headless", "--once", "--dry-run", "--minimized"].contains(&a.as_str())) {
+    let paths = Paths::discover();
+
+    // `--sort` swallows everything after it as paths.
+    if let Some(pos) = args.iter().position(|a| a == "--sort") {
+        let targets: Vec<PathBuf> = args[pos + 1..].iter().map(PathBuf::from).collect();
+        return run_sort(&paths, targets);
+    }
+    if let Some(bad) = args.iter().find(|a| !FLAGS.contains(&a.as_str())) {
         eprintln!("autosort: unknown option '{bad}'\n\n{HELP}");
         return ExitCode::from(2);
     }
@@ -48,8 +64,23 @@ fn main() -> ExitCode {
         eprintln!("autosort: --dry-run only makes sense together with --once");
         return ExitCode::from(2);
     }
-
-    let paths = Paths::discover();
+    if has("--install-integration") || has("--uninstall-integration") {
+        let result = if has("--install-integration") {
+            std::env::current_exe().map_err(|e| e.to_string()).and_then(|exe| integration::install(&exe))
+        } else {
+            integration::uninstall()
+        };
+        return match result {
+            Ok(msg) => {
+                println!("{msg}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("autosort: {e}");
+                ExitCode::from(1)
+            }
+        };
+    }
     if has("--once") {
         return run_once(&paths, has("--dry-run"));
     }
@@ -80,6 +111,10 @@ fn print_entry(e: &autosort_core::ActivityEntry) {
     println!("[{mark}] {} — {} · {} — {}", e.file, e.rule, e.action, e.detail);
 }
 
+fn engine(paths: &Paths, settle: u64) -> Engine {
+    Engine::new(settle, Arc::new(History::persistent(paths.history()))).with_stats(Arc::new(Stats::persistent(paths.stats())))
+}
+
 fn run_once(paths: &Paths, dry_run: bool) -> ExitCode {
     let _lock = if dry_run {
         None
@@ -93,7 +128,7 @@ fn run_once(paths: &Paths, dry_run: bool) -> ExitCode {
         }
     };
     let cfg = load_config(paths);
-    let engine = Engine::new(cfg.settle_seconds, Arc::new(History::persistent(paths.history())));
+    let engine = engine(paths, cfg.settle_seconds);
     let log = ActivityLog::new(Some(paths.activity()));
     let (mut total, mut failed) = (0, 0);
     for folder in cfg.folders.iter().filter(|f| f.enabled) {
@@ -111,6 +146,48 @@ fn run_once(paths: &Paths, dry_run: bool) -> ExitCode {
     if failed > 0 { ExitCode::from(1) } else { ExitCode::SUCCESS }
 }
 
+/// `autosort --sort PATH...` — explicit requests ignore "already handled" memory and the settle delay.
+fn run_sort(paths: &Paths, targets: Vec<PathBuf>) -> ExitCode {
+    if targets.is_empty() {
+        eprintln!("autosort: --sort needs at least one file or folder");
+        return ExitCode::from(2);
+    }
+    let cfg = load_config(paths);
+    let (plans, rejected) = sorting::plan_sort(&cfg, &targets);
+    for (p, why) in &rejected {
+        eprintln!("autosort: {} {why}", p.display());
+    }
+    let engine = engine(paths, 0);
+    let log = ActivityLog::new(Some(paths.activity()));
+    let mut all = Vec::new();
+    let mut awaiting = false;
+    for plan in plans {
+        awaiting |= plan.folder.rules.iter().any(|r| r.enabled && !r.approved);
+        let opts = RunOptions { only: Some(plan.files), ignore_history: true, ignore_settle: true, force_scheduled: true, ..Default::default() };
+        let entries = engine.process_with(&plan.folder, &opts, chrono::Local::now());
+        for e in &entries {
+            print_entry(e);
+        }
+        log.push(entries.clone());
+        all.extend(entries);
+    }
+    let failed = all.iter().filter(|e| !e.success).count();
+    if all.is_empty() && rejected.is_empty() {
+        let hint = if awaiting { " Some rules are still awaiting approval in AutoSort." } else { "" };
+        println!("No rule matched.{hint}");
+    }
+    if cfg.notifications {
+        if !all.is_empty() {
+            notify::summarize(&all).join().ok();
+        } else if !rejected.is_empty() {
+            notify::message("AutoSort", "That item isn't inside a watched folder. Add its folder in AutoSort first.").join().ok();
+        } else {
+            notify::message("AutoSort", "No rule matched.").join().ok();
+        }
+    }
+    if failed > 0 || !rejected.is_empty() { ExitCode::from(1) } else { ExitCode::SUCCESS }
+}
+
 fn run_headless(paths: &Paths, _lock: InstanceLock) -> ExitCode {
     let cfg = load_config(paths);
     if cfg.folders.is_empty() {
@@ -123,6 +200,7 @@ fn run_headless(paths: &Paths, _lock: InstanceLock) -> ExitCode {
     let _service = Service::start(
         shared,
         Arc::new(History::persistent(paths.history())),
+        Arc::new(Stats::persistent(paths.stats())),
         Arc::new(move |entries| {
             for e in &entries {
                 print_entry(e);

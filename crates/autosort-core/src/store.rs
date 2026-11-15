@@ -30,6 +30,9 @@ impl Paths {
     pub fn history(&self) -> PathBuf {
         self.dir.join("history.json")
     }
+    pub fn stats(&self) -> PathBuf {
+        self.dir.join("stats.json")
+    }
     pub fn lock(&self) -> PathBuf {
         self.dir.join("autosort.lock")
     }
@@ -60,10 +63,13 @@ impl InstanceLock {
     }
 }
 
-/// Bounded, persisted activity log shared between the service thread and the UI.
+/// Bounded, persisted activity log shared between the service thread, the UI and other AutoSort
+/// processes (e.g. `autosort --sort` run from Finder). It merges with the file on disk so entries written by
+/// another process are never lost.
 pub struct ActivityLog {
     entries: std::sync::Mutex<Vec<crate::model::ActivityEntry>>,
     file: Option<PathBuf>,
+    seen_mtime: std::sync::Mutex<Option<std::time::SystemTime>>,
 }
 
 const MAX_ACTIVITY: usize = 1000;
@@ -71,27 +77,70 @@ const MAX_ACTIVITY: usize = 1000;
 impl ActivityLog {
     pub fn new(file: Option<PathBuf>) -> Self {
         let entries = file.as_deref().and_then(load_json::<Vec<crate::model::ActivityEntry>>).unwrap_or_default();
-        ActivityLog { entries: std::sync::Mutex::new(entries), file }
+        let mtime = file.as_deref().and_then(|f| fs::metadata(f).ok()).and_then(|m| m.modified().ok());
+        ActivityLog { entries: std::sync::Mutex::new(entries), file, seen_mtime: std::sync::Mutex::new(mtime) }
+    }
+
+    fn disk_mtime(&self) -> Option<std::time::SystemTime> {
+        self.file.as_deref().and_then(|f| fs::metadata(f).ok()).and_then(|m| m.modified().ok())
+    }
+
+    /// Adds entries another process wrote and copies over their "undone" marks.
+    fn merge_from_disk(&self, entries: &mut Vec<crate::model::ActivityEntry>) {
+        let Some(file) = &self.file else { return };
+        let Some(disk) = load_json::<Vec<crate::model::ActivityEntry>>(file) else { return };
+        let mut changed = false;
+        for d in disk {
+            match entries.iter_mut().find(|e| e.id == d.id) {
+                Some(e) => {
+                    if d.undone && !e.undone {
+                        e.undone = true;
+                    }
+                }
+                None => {
+                    entries.push(d);
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            entries.sort_by_key(|e| e.time);
+            let len = entries.len();
+            if len > MAX_ACTIVITY {
+                entries.drain(..len - MAX_ACTIVITY);
+            }
+        }
+    }
+
+    fn persist(&self, entries: &[crate::model::ActivityEntry]) {
+        if let Some(f) = &self.file {
+            let _ = save_json(f, &entries);
+            *self.seen_mtime.lock().unwrap() = self.disk_mtime();
+        }
     }
 
     pub fn push(&self, new: Vec<crate::model::ActivityEntry>) {
         let mut e = self.entries.lock().unwrap();
+        self.merge_from_disk(&mut e);
         e.extend(new);
         let len = e.len();
         if len > MAX_ACTIVITY {
             e.drain(..len - MAX_ACTIVITY);
         }
-        if let Some(f) = &self.file {
-            let _ = save_json(f, &*e);
-        }
+        self.persist(&e);
     }
 
     pub fn snapshot(&self) -> Vec<crate::model::ActivityEntry> {
-        self.entries.lock().unwrap().clone()
+        let mut e = self.entries.lock().unwrap();
+        if self.file.is_some() && *self.seen_mtime.lock().unwrap() != self.disk_mtime() {
+            self.merge_from_disk(&mut e);
+            *self.seen_mtime.lock().unwrap() = self.disk_mtime();
+        }
+        e.clone()
     }
 
     pub fn len(&self) -> usize {
-        self.entries.lock().unwrap().len()
+        self.snapshot().len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -99,10 +148,9 @@ impl ActivityLog {
     }
 
     pub fn clear(&self) {
-        self.entries.lock().unwrap().clear();
-        if let Some(f) = &self.file {
-            let _ = save_json(f, &Vec::<crate::model::ActivityEntry>::new());
-        }
+        let mut e = self.entries.lock().unwrap();
+        e.clear();
+        self.persist(&e);
     }
 }
 
@@ -122,9 +170,7 @@ impl ActivityLog {
         if let Some(entry) = e.iter_mut().find(|x| x.id == id) {
             entry.undone = true;
         }
-        if let Some(f) = &self.file {
-            let _ = save_json(f, &*e);
-        }
+        self.persist(&e);
         Ok(message)
     }
 }

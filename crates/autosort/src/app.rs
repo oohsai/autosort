@@ -66,10 +66,13 @@ pub struct AutoSortApp {
     last_saved: String,
     folder_sig: Vec<(Uuid, String, bool, bool)>,
     pub(crate) history: Arc<History>,
+    pub(crate) stats: Arc<Stats>,
     pub(crate) activity: Arc<ActivityLog>,
     pub(crate) service: Service,
     pub(crate) page: Page,
     pub(crate) paused: bool,
+    /// Ask the service for an immediate pass once this frame's config has been synced.
+    pub(crate) pending_sweep: bool,
     pub(crate) modal: Option<ModalState>,
     pub(crate) preview: Option<Preview>,
     pub(crate) preview_rx: Option<Receiver<Vec<ActivityEntry>>>,
@@ -101,6 +104,7 @@ impl AutoSortApp {
         let config: AppConfig = store::load_json(&paths.config()).unwrap_or_default();
         let shared = Arc::new(Mutex::new(config.clone()));
         let history = Arc::new(History::persistent(paths.history()));
+        let stats = Arc::new(Stats::persistent(paths.stats()));
         let activity = Arc::new(ActivityLog::new(Some(paths.activity())));
 
         let sink_log = activity.clone();
@@ -109,6 +113,7 @@ impl AutoSortApp {
         let service = Service::start(
             shared.clone(),
             history.clone(),
+            stats.clone(),
             Arc::new(move |entries| {
                 if sink_cfg.lock().unwrap().notifications {
                     notify::summarize(&entries);
@@ -129,10 +134,12 @@ impl AutoSortApp {
             shared,
             last_saved,
             history,
+            stats,
             activity,
             service,
             page,
             paused: false,
+            pending_sweep: false,
             modal: None,
             preview: None,
             preview_rx: None,
@@ -177,6 +184,8 @@ impl AutoSortApp {
         folder.include_subfolders = form.include_subfolders;
         if form.starter_rules {
             folder.rules = presets::downloads_starter_rules();
+            let learning = self.config.learning_mode;
+            folder.rules.iter_mut().for_each(|r| r.approved = !learning);
         }
         let name = folder.display_name();
         self.page = Page::Folder(folder.id);
@@ -189,7 +198,7 @@ impl AutoSortApp {
         self.preview = Some(Preview { folder_name: folder.display_name(), entries: None });
         self.preview_rx = Some(rx);
         self.modal = Some(ModalState::Preview);
-        let engine = Engine::new(self.config.settle_seconds, self.history.clone());
+        let engine = Engine::new(self.config.settle_seconds, self.history.clone()).with_stats(self.stats.clone());
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let _ = tx.send(engine.process(&folder, true, chrono::Local::now()));
@@ -286,10 +295,11 @@ impl AutoSortApp {
                     .inner_margin(Margin::symmetric(16, 12))
                     .shadow(egui::Shadow { offset: [0, 8], blur: 24, spread: 0, color: Color32::from_black_alpha(120) })
                     .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            let (r, _) = ui.allocate_exact_size(vec2(8.0, 8.0), egui::Sense::hover());
+                        ui.set_max_width(420.0);
+                        ui.horizontal_top(|ui| {
+                            let (r, _) = ui.allocate_exact_size(vec2(8.0, 18.0), egui::Sense::hover());
                             ui.painter().circle_filled(r.center(), 4.0, if toast.ok { t::ACCENT } else { t::DIM });
-                            ui.label(RichText::new(&toast.text).color(t::TEXT));
+                            ui.add(egui::Label::new(RichText::new(&toast.text).color(t::TEXT)).wrap());
                         });
                     });
             });
@@ -328,6 +338,9 @@ impl eframe::App for AutoSortApp {
         self.modals(&ctx);
         self.draw_toast(&ctx);
         self.sync_config();
+        if std::mem::take(&mut self.pending_sweep) {
+            self.service.sweep();
+        }
         // keep the activity list fresh even when no input arrives
         ctx.request_repaint_after(Duration::from_secs(2));
     }

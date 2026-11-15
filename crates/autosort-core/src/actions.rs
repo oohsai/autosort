@@ -31,14 +31,16 @@ pub fn execute(
     dry_run: bool,
     now: DateTime<Local>,
 ) -> Result<Outcome, String> {
-    let param = expand(action.parameter.trim(), info, folder, now);
-    if action.kind.uses_parameter() && param.is_empty() {
+    let raw = action.parameter.trim();
+    if action.kind.uses_parameter() && !action.kind.parameter_optional() && raw.is_empty() {
         return Err(format!("“{}” needs a value", action.kind.label()));
     }
+    let param = expand(raw, info, folder, now);
+    let unchanged = |message: String| Outcome { new_path: info.path.clone(), message, removed: false, undo: None };
     match action.kind {
         ActionKind::Move => transfer(info, folder, &param, action.conflict, dry_run, true),
         ActionKind::Copy => transfer(info, folder, &param, action.conflict, dry_run, false),
-        ActionKind::Rename => rename(info, &param, action.conflict, dry_run),
+        ActionKind::Rename => rename(info, raw, folder, now, action.conflict, dry_run),
         ActionKind::Trash => {
             if !dry_run {
                 trash::delete(&info.path).map_err(|e| format!("could not move to trash: {e}"))?;
@@ -46,6 +48,75 @@ pub fn execute(
             Ok(Outcome { new_path: info.path.clone(), message: "Moved to Trash".into(), removed: true, undo: None })
         }
         ActionKind::RunCommand => run_command(info, &action.parameter, dry_run),
+        ActionKind::AddTags => {
+            let names: Vec<String> = param.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect();
+            if names.is_empty() {
+                return Err("no tags given".into());
+            }
+            if !dry_run {
+                crate::meta::add_tags(&info.path, &names)?;
+            }
+            Ok(unchanged(format!("Added tags: {}", names.join(", "))))
+        }
+        ActionKind::OpenWith => {
+            let (program, args) = open_command(std::env::consts::OS, &param, &info.path);
+            if dry_run {
+                return Ok(unchanged(if param.is_empty() { "Would open the file".into() } else { format!("Would open with {param}") }));
+            }
+            launch(&program, &args, Duration::from_secs(5))?;
+            Ok(unchanged(if param.is_empty() { "Opened".into() } else { format!("Opened with {param}") }))
+        }
+        ActionKind::RunShortcut => {
+            let (program, args) = shortcut_command(std::env::consts::OS, &param, &info.path)
+                .ok_or_else(|| "Shortcuts are only available on macOS".to_string())?;
+            if dry_run {
+                return Ok(unchanged(format!("Would run Shortcut “{param}”")));
+            }
+            launch(&program, &args, COMMAND_TIMEOUT)?;
+            Ok(unchanged(format!("Ran Shortcut “{param}”")))
+        }
+    }
+}
+
+/// Program and arguments that open `path` (with `app`, or the default application when `app` is empty).
+pub fn open_command(os: &str, app: &str, path: &Path) -> (String, Vec<String>) {
+    let p = path.to_string_lossy().into_owned();
+    match os {
+        "macos" if app.is_empty() => ("open".into(), vec![p]),
+        "macos" => ("open".into(), vec!["-a".into(), app.into(), p]),
+        "windows" if app.is_empty() => ("cmd".into(), vec!["/C".into(), "start".into(), "".into(), p]),
+        "windows" => ("cmd".into(), vec!["/C".into(), "start".into(), "".into(), app.into(), p]),
+        _ if app.is_empty() => ("xdg-open".into(), vec![p]),
+        _ => (app.into(), vec![p]),
+    }
+}
+
+/// `shortcuts run "<name>" --input-path <file>` (macOS only).
+pub fn shortcut_command(os: &str, name: &str, path: &Path) -> Option<(String, Vec<String>)> {
+    (os == "macos").then(|| {
+        ("shortcuts".to_string(), vec!["run".into(), name.into(), "--input-path".into(), path.to_string_lossy().into_owned()])
+    })
+}
+
+/// Starts a program. Returns an error if it fails to start or exits unsuccessfully within `wait`;
+/// if it is still running after `wait` (a GUI app that stays open) that counts as success.
+fn launch(program: &str, args: &[String], wait: Duration) -> Result<(), String> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("could not start {program}: {e}"))?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => return Err(format!("{program} exited with {status}")),
+            Ok(None) if started.elapsed() > wait => return Ok(()),
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(e) => return Err(format!("{program} failed: {e}")),
+        }
     }
 }
 
@@ -100,18 +171,45 @@ fn transfer(
     })
 }
 
-fn rename(info: &FileInfo, pattern: &str, policy: ConflictPolicy, dry_run: bool) -> Result<Outcome, String> {
-    let base: String = pattern
-        .chars()
+fn clean_name(raw: &str) -> String {
+    raw.chars()
         .map(|c| if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') { '-' } else { c })
-        .collect();
-    let base = base.trim().to_string();
-    if base.is_empty() {
-        return Err("rename pattern produced an empty name".into());
-    }
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+fn rename(
+    info: &FileInfo,
+    template: &str,
+    folder: &Path,
+    now: DateTime<Local>,
+    policy: ConflictPolicy,
+    dry_run: bool,
+) -> Result<Outcome, String> {
     let ext = info.path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
     let dir = info.path.parent().unwrap_or(Path::new(""));
-    let dest = dir.join(format!("{base}{ext}"));
+    let candidate = |counter: Option<u32>| -> Result<PathBuf, String> {
+        let base = clean_name(&crate::template::expand_with(template, info, folder, now, counter));
+        if base.is_empty() {
+            return Err("rename pattern produced an empty name".into());
+        }
+        Ok(dir.join(format!("{base}{ext}")))
+    };
+    // {counter}: take the first number whose name is free (or is this very file's current name).
+    let dest = if crate::template::uses_counter(template) {
+        let mut chosen = None;
+        for n in 1..100_000u32 {
+            let p = candidate(Some(n))?;
+            if p == info.path || !p.exists() {
+                chosen = Some(p);
+                break;
+            }
+        }
+        chosen.ok_or_else(|| "no free number left for {counter}".to_string())?
+    } else {
+        candidate(None)?
+    };
     if dest == info.path {
         return Ok(Outcome { new_path: info.path.clone(), message: "Name unchanged".into(), removed: false, undo: None });
     }
